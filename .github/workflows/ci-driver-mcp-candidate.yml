@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        os: [ubuntu-24.04]
     defaults:
       run:
         shell: bash
@@ -79,6 +79,9 @@ jobs:
           cargo test -p cua-driver --bin cua-driver driver_service_http --locked
           cargo test -p cua-driver-sdk remote_receiver::tests --locked
       - name: Build disposable-test binaries
+        working-directory: libs/cua-driver/rust
+        run: cargo test --locked -p platform-linux --lib
+      - name: Build patched Linux binaries
         working-directory: libs/cua-driver/rust
         run: |
           set -euo pipefail

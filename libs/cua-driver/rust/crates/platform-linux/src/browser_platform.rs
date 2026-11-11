@@ -351,6 +351,59 @@ fn default_user_data_dir(product: BrowserProduct) -> Option<PathBuf> {
     Some(home.join(relative))
 }
 
+fn browser_command_line_args(bytes: &[u8]) -> Result<Vec<String>, BrowserRefusal> {
+    let args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    // Chromium can rewrite its process title into argv[0], replacing the
+    // original NUL-separated arguments with one shell-quoted command line.
+    // Missing its explicit profile here would select another profile's stale
+    // DevToolsActivePort file even though the listener belongs to this PID.
+    if args.len() == 1 && args[0].contains(" --") {
+        return shlex::split(&args[0]).ok_or_else(|| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserBindingAmbiguous,
+                "the browser's rewritten command line has invalid quoting",
+            )
+        });
+    }
+    Ok(args)
+}
+
+fn user_data_dir_argument(args: &[String]) -> Result<Option<PathBuf>, BrowserRefusal> {
+    let mut directories = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        let path = if let Some(path) = arg.strip_prefix("--user-data-dir=") {
+            Some(path)
+        } else if arg == "--user-data-dir" {
+            Some(args.get(index + 1).map_or("", String::as_str))
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            if path.is_empty() || path.starts_with("--") {
+                return Err(BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserBindingAmbiguous,
+                    "the browser's --user-data-dir argument has no path",
+                ));
+            }
+            directories.push(PathBuf::from(path));
+        }
+    }
+    directories.sort();
+    directories.dedup();
+    match directories.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path.clone())),
+        _ => Err(BrowserRefusal::new(
+            BrowserRefusalCode::BrowserBindingAmbiguous,
+            "browser process has multiple distinct --user-data-dir arguments",
+        )),
+    }
+}
+
 fn user_data_dir_for_pid(pid: i64) -> Result<Option<PathBuf>, BrowserRefusal> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).map_err(|_| {
         BrowserRefusal::new(
@@ -358,27 +411,9 @@ fn user_data_dir_for_pid(pid: i64) -> Result<Option<PathBuf>, BrowserRefusal> {
             format!("browser process {pid} is no longer available"),
         )
     })?;
-    let args = bytes
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
-        .collect::<Vec<_>>();
-    let mut directories = Vec::new();
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(path) = arg.strip_prefix("--user-data-dir=") {
-            if !path.is_empty() {
-                directories.push(PathBuf::from(path));
-            }
-        } else if arg == "--user-data-dir" {
-            if let Some(path) = args.get(index + 1).filter(|path| !path.is_empty()) {
-                directories.push(PathBuf::from(path));
-            }
-        }
-    }
-    directories.sort();
-    directories.dedup();
-    match directories.as_slice() {
-        [] => {
+    let args = browser_command_line_args(&bytes)?;
+    match user_data_dir_argument(&args)? {
+        None => {
             let Some(executable) = std::fs::read_link(format!("/proc/{pid}/exe"))
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -387,8 +422,8 @@ fn user_data_dir_for_pid(pid: i64) -> Result<Option<PathBuf>, BrowserRefusal> {
             };
             Ok(default_user_data_dir(browser_product(&executable)))
         }
-        [path] if path.is_absolute() => Ok(Some(path.clone())),
-        [path] => {
+        Some(path) if path.is_absolute() => Ok(Some(path)),
+        Some(path) => {
             let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).map_err(|_| {
                 BrowserRefusal::new(
                     BrowserRefusalCode::BrowserBindingStale,
@@ -397,10 +432,6 @@ fn user_data_dir_for_pid(pid: i64) -> Result<Option<PathBuf>, BrowserRefusal> {
             })?;
             Ok(Some(cwd.join(path)))
         }
-        _ => Err(BrowserRefusal::new(
-            BrowserRefusalCode::BrowserBindingAmbiguous,
-            "browser process has multiple distinct --user-data-dir arguments",
-        )),
     }
 }
 
@@ -1291,6 +1322,53 @@ impl BrowserPlatform for LinuxBrowserPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_browser_profile_survives_rewritten_process_titles() {
+        for command_line in [
+            b"/opt/chrome\0--user-data-dir=/tmp/browser-root\0--profile-directory=Default\0"
+                .as_slice(),
+            b"/opt/chrome --user-data-dir=/tmp/browser-root --profile-directory=Default\0",
+            b"/opt/chrome --user-data-dir /tmp/browser-root --profile-directory=Default\0",
+        ] {
+            let args = browser_command_line_args(command_line).unwrap();
+            assert_eq!(
+                user_data_dir_argument(&args).unwrap(),
+                Some(PathBuf::from("/tmp/browser-root"))
+            );
+        }
+        for command_line in [
+            b"/opt/chrome\0--user-data-dir=/tmp/browser root\0".as_slice(),
+            b"/opt/chrome --user-data-dir='/tmp/browser root' --profile-directory=Default\0",
+            b"/opt/chrome --user-data-dir \"/tmp/browser root\" --profile-directory=Default\0",
+        ] {
+            assert_eq!(
+                user_data_dir_argument(&browser_command_line_args(command_line).unwrap()).unwrap(),
+                Some(PathBuf::from("/tmp/browser root"))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_explicit_browser_profiles_never_select_the_default_profile() {
+        let malformed =
+            browser_command_line_args(b"/opt/chrome --user-data-dir='/tmp/open\0").unwrap_err();
+        assert_eq!(malformed.code, BrowserRefusalCode::BrowserBindingAmbiguous);
+        for command_line in [
+            b"/opt/chrome --user-data-dir=\0".as_slice(),
+            b"/opt/chrome --user-data-dir\0",
+            b"/opt/chrome --user-data-dir --profile-directory=Default\0",
+            b"/opt/chrome --user-data-dir=/tmp/one --user-data-dir=/tmp/two\0",
+        ] {
+            let error = user_data_dir_argument(&browser_command_line_args(command_line).unwrap())
+                .unwrap_err();
+            assert_eq!(error.code, BrowserRefusalCode::BrowserBindingAmbiguous);
+        }
+        assert_eq!(
+            user_data_dir_argument(&browser_command_line_args(b"/opt/chrome\0").unwrap()).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn x11_identity_and_cardinality_precede_compositor_selection() {

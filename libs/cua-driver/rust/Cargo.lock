@@ -3470,6 +3470,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shlex",
  "socket2",
  "tempfile",
  "thiserror 1.0.69",
